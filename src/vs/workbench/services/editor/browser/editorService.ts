@@ -4,55 +4,59 @@
  *--------------------------------------------------------------------------------------------*/
 'use strict';
 
-import {TPromise, Promise} from 'vs/base/common/winjs.base';
+import { TPromise } from 'vs/base/common/winjs.base';
 import URI from 'vs/base/common/uri';
 import network = require('vs/base/common/network');
-import {guessMimeTypes} from 'vs/base/common/mime';
-import {Registry} from 'vs/platform/platform';
-import types = require('vs/base/common/types');
-import {IDiffEditor, ICodeEditor} from 'vs/editor/browser/editorBrowser';
-import {ICommonCodeEditor, IModel, EditorType, IEditor as ICommonEditor} from 'vs/editor/common/editorCommon';
-import {BaseEditor, IEditorRegistry, Extensions} from 'vs/workbench/browser/parts/editor/baseEditor';
-import {EditorInput, EditorOptions, IFileEditorInput, TextEditorOptions} from 'vs/workbench/common/editor';
-import {UntitledEditorInput} from 'vs/workbench/browser/parts/editor/untitledEditorInput';
-import {DiffEditorInput} from 'vs/workbench/browser/parts/editor/diffEditorInput';
-import {IUntitledEditorService} from 'vs/workbench/services/untitled/browser/untitledEditorService';
-import {IWorkbenchEditorService, EditorArrangement, IFileInput} from 'vs/workbench/services/editor/common/editorService';
-import {IStorageService} from 'vs/platform/storage/common/storage';
-import {IEditorInput, IEditorModel, IEditorOptions, ITextInput, Position, IEditor, IResourceInput, ITextEditorModel} from 'vs/platform/editor/common/editor';
-import {IInstantiationService} from 'vs/platform/instantiation/common/instantiation';
-import {AsyncDescriptor} from 'vs/platform/instantiation/common/descriptors';
-import {IWorkspaceContextService} from 'vs/platform/workspace/common/workspace';
+import { Registry } from 'vs/platform/registry/common/platform';
+import { basename, dirname } from 'vs/base/common/paths';
+import { BaseEditor } from 'vs/workbench/browser/parts/editor/baseEditor';
+import { EditorInput, EditorOptions, TextEditorOptions, IEditorRegistry, Extensions, SideBySideEditorInput, IFileEditorInput, IFileInputFactory } from 'vs/workbench/common/editor';
+import { ResourceEditorInput } from 'vs/workbench/common/editor/resourceEditorInput';
+import { IUntitledEditorService, UNTITLED_SCHEMA } from 'vs/workbench/services/untitled/common/untitledEditorService';
+import { IWorkbenchEditorService, IResourceInputType } from 'vs/workbench/services/editor/common/editorService';
+import { IEditorInput, IEditorOptions, ITextEditorOptions, Position, Direction, IEditor, IResourceInput, IResourceDiffInput, IResourceSideBySideInput, IUntitledResourceInput } from 'vs/platform/editor/common/editor';
+import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
+import { DiffEditorInput } from 'vs/workbench/common/editor/diffEditorInput';
+import { IWorkspaceContextService } from 'vs/platform/workspace/common/workspace';
+import nls = require('vs/nls');
+import { getPathLabel } from 'vs/base/common/labels';
+import { ResourceMap } from 'vs/base/common/map';
+import { once } from 'vs/base/common/event';
+import { IEnvironmentService } from 'vs/platform/environment/common/environment';
 
 export interface IEditorPart {
-	setEditors(inputs: EditorInput[], options?: EditorOptions[]): TPromise<BaseEditor[]>;
-	openEditor(input?: EditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<BaseEditor>;
-	openEditor(input?: EditorInput, options?: EditorOptions, position?: Position): TPromise<BaseEditor>;
-	closeEditors(othersOnly?: boolean): TPromise<void>;
+	openEditor(input?: IEditorInput, options?: IEditorOptions | ITextEditorOptions, sideBySide?: boolean): TPromise<BaseEditor>;
+	openEditor(input?: IEditorInput, options?: IEditorOptions | ITextEditorOptions, position?: Position): TPromise<BaseEditor>;
+	openEditors(editors: { input: IEditorInput, position: Position, options?: IEditorOptions | ITextEditorOptions }[]): TPromise<BaseEditor[]>;
+	replaceEditors(editors: { toReplace: IEditorInput, replaceWith: IEditorInput, options?: IEditorOptions | ITextEditorOptions }[], position?: Position): TPromise<BaseEditor[]>;
+	closeEditor(position: Position, input: IEditorInput): TPromise<void>;
+	closeEditors(position: Position, filter?: { except?: IEditorInput, direction?: Direction, unmodifiedOnly?: boolean }): TPromise<void>;
+	closeAllEditors(except?: Position): TPromise<void>;
 	getActiveEditor(): BaseEditor;
 	getVisibleEditors(): IEditor[];
-	getActiveEditorInput(): EditorInput;
-	moveEditor(from: Position, to: Position): void;
-	arrangeEditors(arrangement: EditorArrangement): void;
+	getActiveEditorInput(): IEditorInput;
 }
 
-export class WorkbenchEditorService implements IWorkbenchEditorService {
-	public serviceId = IWorkbenchEditorService;
+type ICachedEditorInput = ResourceEditorInput | IFileEditorInput;
 
-	private editorPart: IEditorPart;
-	private fileInputDescriptor: AsyncDescriptor<IFileEditorInput>;
+export class WorkbenchEditorService implements IWorkbenchEditorService {
+
+	public _serviceBrand: any;
+
+	private static CACHE: ResourceMap<ICachedEditorInput> = new ResourceMap<ICachedEditorInput>();
+
+	private editorPart: IEditorPart | IWorkbenchEditorService;
+	private fileInputFactory: IFileInputFactory;
 
 	constructor(
-		editorPart: IEditorPart,
+		editorPart: IEditorPart | IWorkbenchEditorService,
 		@IUntitledEditorService private untitledEditorService: IUntitledEditorService,
-		@IInstantiationService private instantiationService?: IInstantiationService
+		@IWorkspaceContextService private workspaceContextService: IWorkspaceContextService,
+		@IInstantiationService private instantiationService: IInstantiationService,
+		@IEnvironmentService private environmentService: IEnvironmentService
 	) {
 		this.editorPart = editorPart;
-		this.fileInputDescriptor = (<IEditorRegistry>Registry.as(Extensions.Editors)).getDefaultFileInput();
-	}
-
-	public setInstantiationService(service: IInstantiationService): void {
-		this.instantiationService = service;
+		this.fileInputFactory = Registry.as<IEditorRegistry>(Extensions.Editors).getFileInputFactory();
 	}
 
 	public getActiveEditor(): IEditor {
@@ -67,12 +71,12 @@ export class WorkbenchEditorService implements IWorkbenchEditorService {
 		return this.editorPart.getVisibleEditors();
 	}
 
-	public isVisible(input: IEditorInput, includeDiff: boolean): boolean {
+	public isVisible(input: IEditorInput, includeSideBySide: boolean): boolean {
 		if (!input) {
 			return false;
 		}
 
-		return this.getVisibleEditors().some((editor) => {
+		return this.getVisibleEditors().some(editor => {
 			if (!editor.input) {
 				return false;
 			}
@@ -81,326 +85,278 @@ export class WorkbenchEditorService implements IWorkbenchEditorService {
 				return true;
 			}
 
-			if (includeDiff) {
-				let diffInput = <DiffEditorInput>editor.input;
-				if (types.isFunction(diffInput.getOriginalInput) && types.isFunction(diffInput.getModifiedInput)) {
-					return input.matches(diffInput.getModifiedInput()) || input.matches(diffInput.getOriginalInput());
-				}
+			if (includeSideBySide && editor.input instanceof SideBySideEditorInput) {
+				const sideBySideInput = <SideBySideEditorInput>editor.input;
+				return input.matches(sideBySideInput.master) || input.matches(sideBySideInput.details);
 			}
 
 			return false;
 		});
 	}
 
-	public moveEditor(from: Position, to: Position): void {
-		this.editorPart.moveEditor(from, to);
-	}
-
-	public arrangeEditors(arrangement: EditorArrangement): void {
-		this.editorPart.arrangeEditors(arrangement);
-	}
-
-	public setEditors(inputs: IEditorInput[], options?: IEditorOptions[]): TPromise<IEditor[]>;
-	public setEditors(inputs: IResourceInput[]): TPromise<IEditor[]>;
-	public setEditors(inputs: IFileInput[]): TPromise<IEditor[]>;
-	public setEditors(inputs: any[], options?: any[]): TPromise<IEditor[]> {
-		return Promise.join(inputs.map((input) => this.inputToType(input))).then((typedInputs) => {
-			return this.editorPart.setEditors(typedInputs, options || inputs.map(input => {
-				if (input instanceof EditorInput) {
-					return null; // no options for editor inputs
-				}
-
-				return TextEditorOptions.from(input); // ITextInputs can carry settings, so support that!
-			}));
-		});
-	}
-
 	public openEditor(input: IEditorInput, options?: IEditorOptions, sideBySide?: boolean): TPromise<IEditor>;
 	public openEditor(input: IEditorInput, options?: IEditorOptions, position?: Position): TPromise<IEditor>;
-	public openEditor(input: IResourceInput, position?: Position): TPromise<IEditor>;
-	public openEditor(input: IResourceInput, sideBySide?: boolean): TPromise<IEditor>;
-	public openEditor(input: IFileInput, position?: Position): TPromise<IEditor>;
-	public openEditor(input: IFileInput, sideBySide?: boolean): TPromise<IEditor>;
+	public openEditor(input: IResourceInputType, position?: Position): TPromise<IEditor>;
+	public openEditor(input: IResourceInputType, sideBySide?: boolean): TPromise<IEditor>;
 	public openEditor(input: any, arg2?: any, arg3?: any): TPromise<IEditor> {
-
-		// Support for closing an opened editor at a position by passing null as input
-		if (input === null) {
-			return this.doOpenEditor(input, null, (types.isNumber(arg2) || types.isBoolean(arg2)) ? arg2 : arg3);
+		if (!input) {
+			return TPromise.as<IEditor>(null);
 		}
 
 		// Workbench Input Support
 		if (input instanceof EditorInput) {
-			return this.doOpenEditor(<EditorInput>input, <EditorOptions>arg2, arg3);
+			return this.doOpenEditor(input, this.toOptions(arg2), arg3);
 		}
 
 		// Support opening foreign resources (such as a http link that points outside of the workbench)
-		let resourceInput = <IResourceInput>input;
-		if (URI.isURI(resourceInput.resource)) {
-			let schema = resourceInput.resource.scheme;
-			if (schema === network.schemas.http || schema === network.schemas.https) {
-				window.open(resourceInput.resource.toString());
+		const resourceInput = <IResourceInput>input;
+		if (resourceInput.resource instanceof URI) {
+			const schema = resourceInput.resource.scheme;
+			if (schema === network.Schemas.http || schema === network.Schemas.https) {
+				window.open(resourceInput.resource.toString(true));
+
 				return TPromise.as<IEditor>(null);
 			}
 		}
 
 		// Untyped Text Editor Support (required for code that uses this service below workbench level)
-		let textInput = <IResourceInput>input;
-		return this.inputToType(textInput).then((typedFileInput: EditorInput) => {
-			if (typedFileInput) {
-				return this.doOpenEditor(typedFileInput, TextEditorOptions.from(textInput), arg2);
-			}
+		const textInput = <IResourceInputType>input;
+		const typedInput = this.createInput(textInput);
+		if (typedInput) {
+			return this.doOpenEditor(typedInput, TextEditorOptions.from(textInput), arg2);
+		}
 
-			return TPromise.as<IEditor>(null);
-		});
+		return TPromise.as<IEditor>(null);
+	}
+
+	private toOptions(options?: IEditorOptions | EditorOptions): EditorOptions {
+		if (!options || options instanceof EditorOptions) {
+			return options as EditorOptions;
+		}
+
+		const textOptions: ITextEditorOptions = options;
+		if (!!textOptions.selection) {
+			return TextEditorOptions.create(options);
+		}
+
+		return EditorOptions.create(options);
 	}
 
 	/**
 	 * Allow subclasses to implement their own behavior for opening editor (see below).
 	 */
-	protected doOpenEditor(input: EditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<IEditor>;
-	protected doOpenEditor(input: EditorInput, options?: EditorOptions, position?: Position): TPromise<IEditor>;
-	protected doOpenEditor(input: EditorInput, options?: EditorOptions, arg3?: any): TPromise<IEditor> {
+	protected doOpenEditor(input: IEditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<IEditor>;
+	protected doOpenEditor(input: IEditorInput, options?: EditorOptions, position?: Position): TPromise<IEditor>;
+	protected doOpenEditor(input: IEditorInput, options?: EditorOptions, arg3?: any): TPromise<IEditor> {
 		return this.editorPart.openEditor(input, options, arg3);
 	}
 
-	public closeEditor(editor?: IEditor): TPromise<IEditor>;
-	public closeEditor(position?: Position): TPromise<IEditor>;
-	public closeEditor(arg?: any): TPromise<IEditor> {
-		let targetEditor = this.findEditor(arg);
-		if (targetEditor) {
-			return this.editorPart.openEditor(null, null, targetEditor.position);
-		}
+	public openEditors(editors: { input: IResourceInputType, position: Position }[]): TPromise<IEditor[]>;
+	public openEditors(editors: { input: IEditorInput, position: Position, options?: IEditorOptions }[]): TPromise<IEditor[]>;
+	public openEditors(editors: any[]): TPromise<IEditor[]> {
+		const inputs = editors.map(editor => this.createInput(editor.input));
+		const typedInputs: { input: IEditorInput, position: Position, options?: EditorOptions }[] = inputs.map((input, index) => {
+			const options = editors[index].input instanceof EditorInput ? this.toOptions(editors[index].options) : TextEditorOptions.from(editors[index].input);
 
-		return TPromise.as(null);
+			return {
+				input,
+				options,
+				position: editors[index].position
+			};
+		});
+
+		return this.editorPart.openEditors(typedInputs);
 	}
 
-	public closeEditors(othersOnly?: boolean): TPromise<void> {
-		return this.editorPart.closeEditors(othersOnly);
+	public replaceEditors(editors: { toReplace: IResourceInputType, replaceWith: IResourceInputType }[], position?: Position): TPromise<IEditor[]>;
+	public replaceEditors(editors: { toReplace: IEditorInput, replaceWith: IEditorInput, options?: IEditorOptions }[], position?: Position): TPromise<IEditor[]>;
+	public replaceEditors(editors: any[], position?: Position): TPromise<IEditor[]> {
+		const toReplaceInputs = editors.map(editor => this.createInput(editor.toReplace));
+		const replaceWithInputs = editors.map(editor => this.createInput(editor.replaceWith));
+		const typedReplacements: { toReplace: IEditorInput, replaceWith: IEditorInput, options?: EditorOptions }[] = editors.map((editor, index) => {
+			const options = editor.toReplace instanceof EditorInput ? this.toOptions(editor.options) : TextEditorOptions.from(editor.replaceWith);
+
+			return {
+				toReplace: toReplaceInputs[index],
+				replaceWith: replaceWithInputs[index],
+				options
+			};
+		});
+
+		return this.editorPart.replaceEditors(typedReplacements, position);
 	}
 
-	public focusEditor(editor?: IEditor): TPromise<IEditor>;
-	public focusEditor(position?: Position): TPromise<IEditor>;
-	public focusEditor(arg?: any): TPromise<IEditor> {
-		let targetEditor = this.findEditor(arg);
-		if (targetEditor) {
-			return this.editorPart.openEditor(targetEditor.input, null, targetEditor.position);
-		}
-
-		return TPromise.as(null);
+	public closeEditor(position: Position, input: IEditorInput): TPromise<void> {
+		return this.doCloseEditor(position, input);
 	}
 
-	private findEditor(editor?: IEditor): BaseEditor;
-	private findEditor(position?: Position): BaseEditor;
-	private findEditor(arg?: any): BaseEditor {
+	protected doCloseEditor(position: Position, input: IEditorInput): TPromise<void> {
+		return this.editorPart.closeEditor(position, input);
+	}
 
-		// Editor provided
-		if (arg instanceof BaseEditor) {
-			return <BaseEditor>arg;
+	public closeEditors(position: Position, filter?: { except?: IEditorInput, direction?: Direction, unmodifiedOnly?: boolean }): TPromise<void> {
+		return this.editorPart.closeEditors(position, filter);
+	}
+
+	public closeAllEditors(except?: Position): TPromise<void> {
+		return this.editorPart.closeAllEditors(except);
+	}
+
+	public createInput(input: IEditorInput): EditorInput;
+	public createInput(input: IResourceInputType): EditorInput;
+	public createInput(input: any): IEditorInput {
+
+		// Workbench Input Support
+		if (input instanceof EditorInput) {
+			return input;
 		}
 
-		// Find active editor
-		if (types.isUndefinedOrNull(arg)) {
-			return this.editorPart.getActiveEditor();
+		// Side by Side Support
+		const resourceSideBySideInput = <IResourceSideBySideInput>input;
+		if (resourceSideBySideInput.masterResource && resourceSideBySideInput.detailResource) {
+			const masterInput = this.createInput({ resource: resourceSideBySideInput.masterResource });
+			const detailInput = this.createInput({ resource: resourceSideBySideInput.detailResource });
+
+			return new SideBySideEditorInput(resourceSideBySideInput.label || masterInput.getName(), typeof resourceSideBySideInput.description === 'string' ? resourceSideBySideInput.description : masterInput.getDescription(), detailInput, masterInput);
 		}
 
-		// Target position provided
-		if (types.isNumber(arg)) {
-			let position = <Position>arg;
-			let visibleEditors = this.editorPart.getVisibleEditors();
-			for (let i = 0; i < visibleEditors.length; i++) {
-				let editor = <BaseEditor>visibleEditors[i];
-				if (editor.position === position) {
-					return editor;
-				}
+		// Diff Editor Support
+		const resourceDiffInput = <IResourceDiffInput>input;
+		if (resourceDiffInput.leftResource && resourceDiffInput.rightResource) {
+			const leftInput = this.createInput({ resource: resourceDiffInput.leftResource });
+			const rightInput = this.createInput({ resource: resourceDiffInput.rightResource });
+			const label = resourceDiffInput.label || this.toDiffLabel(resourceDiffInput.leftResource, resourceDiffInput.rightResource, this.workspaceContextService, this.environmentService);
+
+			return new DiffEditorInput(label, resourceDiffInput.description, leftInput, rightInput);
+		}
+
+		// Untitled file support
+		const untitledInput = <IUntitledResourceInput>input;
+		if (!untitledInput.resource || typeof untitledInput.filePath === 'string' || (untitledInput.resource instanceof URI && untitledInput.resource.scheme === UNTITLED_SCHEMA)) {
+			return this.untitledEditorService.createOrGet(untitledInput.filePath ? URI.file(untitledInput.filePath) : untitledInput.resource, untitledInput.language, untitledInput.contents, untitledInput.encoding);
+		}
+
+		const resourceInput = <IResourceInput>input;
+
+		// Files support
+		if (resourceInput.resource instanceof URI && resourceInput.resource.scheme === network.Schemas.file) {
+			return this.createOrGet(resourceInput.resource, this.instantiationService, resourceInput.label, resourceInput.description, resourceInput.encoding);
+		}
+
+		// Any other resource
+		else if (resourceInput.resource instanceof URI) {
+			const label = resourceInput.label || basename(resourceInput.resource.fsPath);
+			let description: string;
+			if (typeof resourceInput.description === 'string') {
+				description = resourceInput.description;
+			} else if (resourceInput.resource.scheme === network.Schemas.file) {
+				description = dirname(resourceInput.resource.fsPath);
 			}
+
+			return this.createOrGet(resourceInput.resource, this.instantiationService, label, description);
 		}
 
 		return null;
 	}
 
-	public resolveEditorModel(input: IEditorInput, refresh?: boolean): TPromise<IEditorModel>;
-	public resolveEditorModel(input: IResourceInput, refresh?: boolean): TPromise<ITextEditorModel>;
-	public resolveEditorModel(input: IFileInput, refresh?: boolean): TPromise<ITextEditorModel>;
-	public resolveEditorModel(input: any, refresh?: boolean): TPromise<IEditorModel> {
-		return this.inputToType(input).then((workbenchInput: IEditorInput) => {
-			if (workbenchInput) {
-
-				// Resolve if applicable
-				if (workbenchInput instanceof EditorInput) {
-					return (<EditorInput>workbenchInput).resolve(!!refresh);
-				}
+	private createOrGet(resource: URI, instantiationService: IInstantiationService, label: string, description: string, encoding?: string): ICachedEditorInput {
+		if (WorkbenchEditorService.CACHE.has(resource)) {
+			const input = WorkbenchEditorService.CACHE.get(resource);
+			if (input instanceof ResourceEditorInput) {
+				input.setName(label);
+				input.setDescription(description);
+			} else {
+				input.setPreferredEncoding(encoding);
 			}
 
-			return TPromise.as<IEditorModel>(null);
+			return input;
+		}
+
+		let input: ICachedEditorInput;
+		if (resource.scheme === network.Schemas.file) {
+			input = this.fileInputFactory.createFileInput(resource, encoding, instantiationService);
+		} else {
+			input = instantiationService.createInstance(ResourceEditorInput, label, description, resource);
+		}
+
+		WorkbenchEditorService.CACHE.set(resource, input);
+		once(input.onDispose)(() => {
+			WorkbenchEditorService.CACHE.delete(resource);
 		});
+
+		return input;
 	}
 
-	public inputToType(input: EditorInput): TPromise<IEditorInput>;
-	public inputToType(input: IResourceInput): TPromise<IEditorInput>;
-	public inputToType(input: any): TPromise<IEditorInput> {
+	private toDiffLabel(res1: URI, res2: URI, context: IWorkspaceContextService, environment: IEnvironmentService): string {
+		const leftName = getPathLabel(res1.fsPath, context, environment);
+		const rightName = getPathLabel(res2.fsPath, context, environment);
 
-		// Workbench Input Support
-		if (input instanceof EditorInput) {
-			return TPromise.as<EditorInput>(<EditorInput>input);
-		}
-
-		// Base Text Editor Support for inmemory resources
-		let resourceInput = <IResourceInput>input;
-		if (URI.isURI(resourceInput.resource) && resourceInput.resource.scheme === network.schemas.inMemory) {
-
-			// For in-memory resources we only support to resolve the input from the current active editor
-			// because the workbench does not track editor models by in memory URL. This concept is only
-			// being used in the code editor.
-			let activeEditor = this.getActiveEditor();
-			if (activeEditor) {
-				let control = <ICommonEditor>activeEditor.getControl();
-				if (types.isFunction(control.getEditorType)) {
-
-					// Single Editor: If code editor model matches, return input from editor
-					if (control.getEditorType() === EditorType.ICodeEditor) {
-						let codeEditor = <ICodeEditor>control;
-						let model = this.findModel(codeEditor, input);
-						if (model) {
-							return TPromise.as(activeEditor.input);
-						}
-					}
-
-					// Diff Editor: If left or right code editor model matches, return associated input
-					else if (control.getEditorType() === EditorType.IDiffEditor) {
-						let diffInput = <DiffEditorInput>activeEditor.input;
-						let diffCodeEditor = <IDiffEditor>control;
-
-						let originalModel = this.findModel(diffCodeEditor.getOriginalEditor(), input);
-						if (originalModel) {
-							return TPromise.as(diffInput.getOriginalInput());
-						}
-
-						let modifiedModel = this.findModel(diffCodeEditor.getModifiedEditor(), input);
-						if (modifiedModel) {
-							return TPromise.as(diffInput.getModifiedInput());
-						}
-					}
-				}
-			}
-		}
-
-		// Untitled file support
-		else if (URI.isURI(resourceInput.resource) && (resourceInput.resource.scheme === UntitledEditorInput.SCHEMA)) {
-			return TPromise.as<EditorInput>(this.untitledEditorService.createOrGet(resourceInput.resource));
-		}
-
-		// Base Text Editor Support for file resources
-		else if (this.fileInputDescriptor && URI.isURI(resourceInput.resource) && resourceInput.resource.scheme === network.schemas.file) {
-			return this.createFileInput(resourceInput.resource, resourceInput.mime);
-		}
-
-		return TPromise.as<EditorInput>(null);
-	}
-
-	private createFileInput(resource: URI, mime?: string): TPromise<IFileEditorInput> {
-		return this.instantiationService.createInstance(this.fileInputDescriptor).then((typedFileInput) => {
-			typedFileInput.setResource(resource);
-			typedFileInput.setMime(mime || guessMimeTypes(resource.fsPath).join(', '));
-
-			return typedFileInput;
-		});
-	}
-
-	private findModel(editor: ICommonCodeEditor, input: IResourceInput): IModel {
-		let model = editor.getModel();
-		if (!model) {
-			return null;
-		}
-
-		return model.getAssociatedResource().equals(input.resource) ? model : null;
+		return nls.localize('compareLabels', "{0} ↔ {1}", leftName, rightName);
 	}
 }
 
-// Helper that implements IEditorPart through an instance of IEditorService
-class EditorPartDelegate implements IEditorPart {
-	private editorService: IWorkbenchEditorService;
-
-	constructor(service: IWorkbenchEditorService) {
-		this.editorService = service;
-	}
-
-	public setEditors(inputs: EditorInput[]): TPromise<BaseEditor[]> {
-		return this.editorService.setEditors(inputs);
-	}
-
-	public openEditor(input?: EditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<IEditor>;
-	public openEditor(input?: EditorInput, options?: EditorOptions, position?: Position): TPromise<IEditor>;
-	public openEditor(input?: EditorInput, options?: EditorOptions, arg3?: any): TPromise<IEditor> {
-		return this.editorService.openEditor(input, options, arg3);
-	}
-
-	public getActiveEditor(): BaseEditor {
-		return <BaseEditor>this.editorService.getActiveEditor();
-	}
-
-	public getActiveEditorInput(): EditorInput {
-		return <EditorInput>this.editorService.getActiveEditorInput();
-	}
-
-	public getVisibleEditors(): IEditor[] {
-		return this.editorService.getVisibleEditors();
-	}
-
-	public moveEditor(from: Position, to: Position): void {
-		this.editorService.moveEditor(from, to);
-	}
-
-	public arrangeEditors(arrangement: EditorArrangement): void {
-		this.editorService.arrangeEditors(arrangement);
-	}
-
-	public closeEditors(othersOnly?: boolean): TPromise<void> {
-		return this.editorService.closeEditors(othersOnly);
-	}
+export interface IEditorOpenHandler {
+	(input: IEditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<BaseEditor>;
+	(input: IEditorInput, options?: EditorOptions, position?: Position): TPromise<BaseEditor>;
 }
 
-export interface IDelegatingWorkbenchEditorHandler {
-	(editor: BaseEditor, input: EditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<boolean>;
-	(editor: BaseEditor, input: EditorInput, options?: EditorOptions, position?: Position): TPromise<boolean>;
+export interface IEditorCloseHandler {
+	(position: Position, input: IEditorInput): TPromise<void>;
 }
 
 /**
  * Subclass of workbench editor service that delegates all calls to the provided editor service. Subclasses can choose to override the behavior
- * of openEditor() by providing a handler. The handler returns a promise that resolves to true or false to indicate if an action has been taken.
- * If false is returned, the service will delegate to editor service for handling the call to openEditor().
+ * of openEditor() and closeEditor() by providing a handler.
  *
- * This gives clients a chance to override the behavior of openEditor() to match their context.
+ * This gives clients a chance to override the behavior of openEditor() and closeEditor().
  */
 export class DelegatingWorkbenchEditorService extends WorkbenchEditorService {
-	private editor: BaseEditor;
-	private handler: IDelegatingWorkbenchEditorHandler;
+	private editorOpenHandler: IEditorOpenHandler;
+	private editorCloseHandler: IEditorCloseHandler;
 
 	constructor(
-		editor: BaseEditor,
-		handler: IDelegatingWorkbenchEditorHandler,
 		@IUntitledEditorService untitledEditorService: IUntitledEditorService,
 		@IInstantiationService instantiationService: IInstantiationService,
-		@IWorkbenchEditorService editorService: IWorkbenchEditorService
+		@IWorkspaceContextService workspaceContextService: IWorkspaceContextService,
+		@IWorkbenchEditorService editorService: IWorkbenchEditorService,
+		@IEnvironmentService environmentService: IEnvironmentService
 	) {
 		super(
-			new EditorPartDelegate(editorService),
+			editorService,
 			untitledEditorService,
-			instantiationService
+			workspaceContextService,
+			instantiationService,
+			environmentService
 		);
-
-		this.editor = editor;
-		this.handler = handler;
 	}
 
-	protected doOpenEditor(input: EditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<IEditor>;
-	protected doOpenEditor(input: EditorInput, options?: EditorOptions, position?: Position): TPromise<IEditor>;
-	protected doOpenEditor(input: EditorInput, options?: EditorOptions, arg3?: any): TPromise<IEditor> {
-		return this.handler(this.editor, input, options, arg3).then((result) => {
-			if (result) {
-				return TPromise.as<BaseEditor>(this.editor);
+	public setEditorOpenHandler(handler: IEditorOpenHandler): void {
+		this.editorOpenHandler = handler;
+	}
+
+	public setEditorCloseHandler(handler: IEditorCloseHandler): void {
+		this.editorCloseHandler = handler;
+	}
+
+	protected doOpenEditor(input: IEditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<IEditor>;
+	protected doOpenEditor(input: IEditorInput, options?: EditorOptions, position?: Position): TPromise<IEditor>;
+	protected doOpenEditor(input: IEditorInput, options?: EditorOptions, arg3?: any): TPromise<IEditor> {
+		const handleOpen = this.editorOpenHandler ? this.editorOpenHandler(input, options, arg3) : TPromise.as(void 0);
+
+		return handleOpen.then(editor => {
+			if (editor) {
+				return TPromise.as<BaseEditor>(editor);
 			}
 
 			return super.doOpenEditor(input, options, arg3);
+		});
+	}
+
+	protected doCloseEditor(position: Position, input: IEditorInput): TPromise<void> {
+		const handleClose = this.editorCloseHandler ? this.editorCloseHandler(position, input) : TPromise.as(void 0);
+
+		return handleClose.then(() => {
+			return super.doCloseEditor(position, input);
 		});
 	}
 }

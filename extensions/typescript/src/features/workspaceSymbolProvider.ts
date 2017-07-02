@@ -1,42 +1,49 @@
-/* --------------------------------------------------------------------------------------------
- * Copyright (c) Microsoft Corporation. All rights reserved.
- * Licensed under the MIT License. See License.txt in the project root for license information.
- * ------------------------------------------------------------------------------------------ */
- 'use strict';
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
 
-import { workspace, Uri, WorkspaceSymbolProvider, SymbolInformation, SymbolKind, TextDocument, Position, Range, CancellationToken } from 'vscode';
+import { workspace, window, Uri, WorkspaceSymbolProvider, SymbolInformation, SymbolKind, Range, Location, CancellationToken } from 'vscode';
 
-import * as Proto  from '../protocol';
+import * as Proto from '../protocol';
 import { ITypescriptServiceClient } from '../typescriptService';
 
-let _kindMapping: { [kind: string]: SymbolKind } = Object.create(null);
-_kindMapping['method'] = SymbolKind.Method;
-_kindMapping['enum'] = SymbolKind.Enum;
-_kindMapping['function'] = SymbolKind.Function;
-_kindMapping['class'] = SymbolKind.Class;
-_kindMapping['interface'] = SymbolKind.Interface;
-_kindMapping['var'] = SymbolKind.Variable;
+function getSymbolKind(item: Proto.NavtoItem): SymbolKind {
+	switch (item.kind) {
+		case 'method': return SymbolKind.Method;
+		case 'enum': return SymbolKind.Enum;
+		case 'function': return SymbolKind.Function;
+		case 'class': return SymbolKind.Class;
+		case 'interface': return SymbolKind.Interface;
+		case 'var': return SymbolKind.Variable;
+		default: return SymbolKind.Variable;
+	}
+}
 
 export default class TypeScriptWorkspaceSymbolProvider implements WorkspaceSymbolProvider {
+	public constructor(
+		private client: ITypescriptServiceClient,
+		private modeId: string) { }
 
-	private client: ITypescriptServiceClient;
-	private modeId: string
-
-	public constructor(client: ITypescriptServiceClient, modeId: string) {
-		this.client = client;
-		this.modeId = modeId;
-	}
-
-	public provideWorkspaceSymbols(search: string, token :CancellationToken): Promise<SymbolInformation[]> {
+	public provideWorkspaceSymbols(search: string, token: CancellationToken): Promise<SymbolInformation[]> {
 		// typescript wants to have a resource even when asking
-		// general questions so we check all open documents for
-		// one that is typescript'ish
-		let uri: Uri;
-		let documents = workspace.textDocuments;
-		for (let document of documents) {
-			if (document.languageId === this.modeId) {
+		// general questions so we check the active editor. If this
+		// doesn't match we take the first TS document.
+		let uri: Uri | undefined = undefined;
+		const editor = window.activeTextEditor;
+		if (editor) {
+			const document = editor.document;
+			if (document && document.languageId === this.modeId) {
 				uri = document.uri;
-				break;
+			}
+		}
+		if (!uri) {
+			const documents = workspace.textDocuments;
+			for (const document of documents) {
+				if (document.languageId === this.modeId) {
+					uri = document.uri;
+					break;
+				}
 			}
 		}
 
@@ -44,31 +51,33 @@ export default class TypeScriptWorkspaceSymbolProvider implements WorkspaceSymbo
 			return Promise.resolve<SymbolInformation[]>([]);
 		}
 
-		let args:Proto.NavtoRequestArgs = {
-			file: this.client.asAbsolutePath(uri),
-			searchValue: search
-		};
-		if (!args.file) {
+		const filepath = this.client.normalizePath(uri);
+		if (!filepath) {
 			return Promise.resolve<SymbolInformation[]>([]);
 		}
-		return this.client.execute('navto', args, token).then((response):SymbolInformation[] => {
+		const args: Proto.NavtoRequestArgs = {
+			file: filepath,
+			searchValue: search
+		};
+		return this.client.execute('navto', args, token).then((response): SymbolInformation[] => {
+			const result: SymbolInformation[] = [];
 			let data = response.body;
 			if (data) {
-				return data.map((item) => {
-
-					let range = new Range(item.start.line - 1, item.start.offset - 1, item.end.line - 1, item.end.offset - 1);
+				for (let item of data) {
+					if (!item.containerName && item.kind === 'alias') {
+						continue;
+					}
+					const range = new Range(item.start.line - 1, item.start.offset - 1, item.end.line - 1, item.end.offset - 1);
 					let label = item.name;
 					if (item.kind === 'method' || item.kind === 'function') {
 						label += '()';
 					}
-					return new SymbolInformation(label, _kindMapping[item.kind], range,
-						this.client.asUrl(item.file), item.containerName);
-				});
-			} else {
-				return [];
+					result.push(new SymbolInformation(label, getSymbolKind(item), item.containerName || '',
+						new Location(this.client.asUrl(item.file), range)));
+				}
 			}
-
-		}, (err) => {
+			return result;
+		}, () => {
 			return [];
 		});
 	}

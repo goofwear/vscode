@@ -1,74 +1,86 @@
-/* --------------------------------------------------------------------------------------------
- * Copyright (c) Microsoft Corporation. All rights reserved.
- * Licensed under the MIT License. See License.txt in the project root for license information.
- * ------------------------------------------------------------------------------------------ */
- 'use strict';
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
 
-import { workspace, TextDocument, TextDocumentChangeEvent, TextDocumentContentChangeEvent, Disposable } from 'vscode';
+import * as cp from 'child_process';
+import * as fs from 'fs';
+
+import { workspace, window, TextDocument, TextDocumentChangeEvent, TextDocumentContentChangeEvent, Disposable, MessageItem, Uri, commands } from 'vscode';
 import * as Proto from '../protocol';
 import { ITypescriptServiceClient } from '../typescriptService';
 import { Delayer } from '../utils/async';
+
+import * as nls from 'vscode-nls';
+let localize = nls.loadMessageBundle();
 
 interface IDiagnosticRequestor {
 	requestDiagnostic(filepath: string): void;
 }
 
+function mode2ScriptKind(mode: string): 'TS' | 'TSX' | 'JS' | 'JSX' | undefined {
+	switch (mode) {
+		case 'typescript': return 'TS';
+		case 'typescriptreact': return 'TSX';
+		case 'javascript': return 'JS';
+		case 'javascriptreact': return 'JSX';
+	}
+	return undefined;
+}
+
 class SyncedBuffer {
 
-	private document: TextDocument;
-	private filepath: string;
-	private diagnosticRequestor: IDiagnosticRequestor;
-	private client: ITypescriptServiceClient;
-
-	constructor(model: TextDocument, filepath: string, diagnosticRequestor: IDiagnosticRequestor, client: ITypescriptServiceClient) {
-		this.document = model;
-		this.filepath = filepath;
-		this.diagnosticRequestor = diagnosticRequestor;
-		this.client = client;
-	}
+	constructor(
+		private readonly document: TextDocument,
+		private readonly filepath: string,
+		private readonly diagnosticRequestor: IDiagnosticRequestor,
+		private readonly client: ITypescriptServiceClient
+	) { }
 
 	public open(): void {
-		let args: Proto.OpenRequestArgs = {
-			file: this.filepath
-		};
-		this.client.execute('open', args, false);
-		// The last line never has a new line character at the end. So we use range.
-		// Sending a replace doesn't work if the buffer is newer then on disk and
-		// if changes are on the last line. In this case the tsserver has less characters
-		// which makes the tsserver bail since the range is invalid
-		/*
-		let lastLineRange = this.document.lineAt(this.document.lineCount - 1).range;
-		let text = this.document.getText();
-		let changeArgs: Proto.ChangeRequestArgs = {
+		const args: Proto.OpenRequestArgs = {
 			file: this.filepath,
-			line: 1,
-			offset: 1,
-			endLine: lastLineRange.end.line + 1,
-			endOffset: lastLineRange.end.character + 1,
-			insertString: text
+			fileContent: this.document.getText(),
+		};
+
+		if (this.client.apiVersion.has203Features()) {
+			const scriptKind = mode2ScriptKind(this.document.languageId);
+			if (scriptKind) {
+				args.scriptKindName = scriptKind;
+			}
 		}
-		this.client.execute('change', changeArgs, false);
-		*/
+
+		if (this.client.apiVersion.has230Features()) {
+			const root = this.client.getWorkspaceRootForResource(this.document.uri);
+			if (root) {
+				args.projectRootPath = root;
+			}
+		}
+
+		this.client.execute('open', args, false);
+	}
+
+	public get lineCount(): number {
+		return this.document.lineCount;
 	}
 
 	public close(): void {
-		let args: Proto.FileRequestArgs = {
+		const args: Proto.FileRequestArgs = {
 			file: this.filepath
 		};
 		this.client.execute('close', args, false);
 	}
 
-	onContentChanged(events: TextDocumentContentChangeEvent[]): void {
-		let filePath = this.client.asAbsolutePath(this.document.uri);
+	public onContentChanged(events: TextDocumentContentChangeEvent[]): void {
+		const filePath = this.client.normalizePath(this.document.uri);
 		if (!filePath) {
 			return;
 		}
 
-		for (let i = 0; i < events.length; i++) {
-			let event = events[i];
-			let range = event.range;
-			let text = event.text;
-			let args: Proto.ChangeRequestArgs = {
+		for (const event of events) {
+			const range = event.range;
+			const text = event.text;
+			const args: Proto.ChangeRequestArgs = {
 				file: filePath,
 				line: range.start.line + 1,
 				offset: range.start.character + 1,
@@ -82,80 +94,114 @@ class SyncedBuffer {
 	}
 }
 
+export interface Diagnostics {
+	delete(file: string): void;
+}
+
+const checkTscVersionSettingKey = 'check.tscVersion';
 export default class BufferSyncSupport {
 
-	private client: ITypescriptServiceClient;
+	private readonly client: ITypescriptServiceClient;
 
-	private modeId: string;
-	private disposables: Disposable[] = [];
-	private syncedBuffers: { [key: string]: SyncedBuffer };
+	private _validate: boolean;
+	private readonly modeIds: Set<string>;
+	private readonly diagnostics: Diagnostics;
+	private readonly disposables: Disposable[] = [];
+	private readonly syncedBuffers: Map<string, SyncedBuffer>;
 
-	private pendingDiagnostics: { [key: string]: number; };
-	private diagnosticDelayer: Delayer<any>;
+	private pendingDiagnostics = new Map<string, number>();
+	private readonly diagnosticDelayer: Delayer<any>;
+	private checkGlobalTSCVersion: boolean;
 
-	constructor(client: ITypescriptServiceClient, modeId: string) {
+	constructor(client: ITypescriptServiceClient, modeIds: string[], diagnostics: Diagnostics, validate: boolean = true) {
 		this.client = client;
-		this.modeId = modeId;
+		this.modeIds = new Set<string>(modeIds);
+		this.diagnostics = diagnostics;
+		this._validate = validate;
 
-		this.pendingDiagnostics = Object.create(null);
-		this.diagnosticDelayer = new Delayer<any>(100);
+		this.diagnosticDelayer = new Delayer<any>(300);
 
-		this.syncedBuffers = Object.create(null);
-		workspace.onDidOpenTextDocument(this.onDidAddDocument, this, this.disposables);
-		workspace.onDidCloseTextDocument(this.onDidRemoveDocument, this, this.disposables);
-		workspace.onDidChangeTextDocument(this.onDidChangeDocument, this, this.disposables);
-		workspace.textDocuments.forEach(this.onDidAddDocument, this);
+		this.syncedBuffers = new Map<string, SyncedBuffer>();
+
+		const tsConfig = workspace.getConfiguration('typescript');
+		this.checkGlobalTSCVersion = client.checkGlobalTSCVersion && this.modeIds.has('typescript') && tsConfig.get(checkTscVersionSettingKey, true);
+	}
+
+	public listen(): void {
+		workspace.onDidOpenTextDocument(this.onDidOpenTextDocument, this, this.disposables);
+		workspace.onDidCloseTextDocument(this.onDidCloseTextDocument, this, this.disposables);
+		workspace.onDidChangeTextDocument(this.onDidChangeTextDocument, this, this.disposables);
+		workspace.textDocuments.forEach(this.onDidOpenTextDocument, this);
+	}
+
+	public get validate(): boolean {
+		return this._validate;
+	}
+
+	public set validate(value: boolean) {
+		this._validate = value;
+	}
+
+	public handles(file: string): boolean {
+		return this.syncedBuffers.has(file);
 	}
 
 	public reOpenDocuments(): void {
-		Object.keys(this.syncedBuffers).forEach(key => {
-			this.syncedBuffers[key].open();
-		})
+		for (const buffer of this.syncedBuffers.values()) {
+			buffer.open();
+		}
 	}
 
 	public dispose(): void {
 		while (this.disposables.length) {
-			this.disposables.pop().dispose();
+			const obj = this.disposables.pop();
+			if (obj) {
+				obj.dispose();
+			}
 		}
 	}
 
-	private onDidAddDocument(document: TextDocument): void {
-		if (document.languageId !== this.modeId) {
+	private onDidOpenTextDocument(document: TextDocument): void {
+		if (!this.modeIds.has(document.languageId)) {
 			return;
 		}
-		if (document.isUntitled) {
-			return;
-		}
-		let resource = document.uri;
-		let filepath = this.client.asAbsolutePath(resource);
+		const resource = document.uri;
+		const filepath = this.client.normalizePath(resource);
 		if (!filepath) {
 			return;
 		}
-		let syncedBuffer = new SyncedBuffer(document, filepath, this, this.client);
-		this.syncedBuffers[filepath] = syncedBuffer;
+		const syncedBuffer = new SyncedBuffer(document, filepath, this, this.client);
+		this.syncedBuffers.set(filepath, syncedBuffer);
 		syncedBuffer.open();
 		this.requestDiagnostic(filepath);
+		if (document.languageId === 'typescript' || document.languageId === 'typescriptreact') {
+			this.checkTSCVersion();
+		}
 	}
 
-	private onDidRemoveDocument(document: TextDocument): void {
-		let filepath: string = this.client.asAbsolutePath(document.uri);
+	private onDidCloseTextDocument(document: TextDocument): void {
+		let filepath = this.client.normalizePath(document.uri);
 		if (!filepath) {
 			return;
 		}
-		let syncedBuffer = this.syncedBuffers[filepath];
+		const syncedBuffer = this.syncedBuffers.get(filepath);
 		if (!syncedBuffer) {
 			return;
 		}
-		delete this.syncedBuffers[filepath];
+		this.diagnostics.delete(filepath);
+		this.syncedBuffers.delete(filepath);
 		syncedBuffer.close();
+		if (!fs.existsSync(filepath)) {
+			this.requestAllDiagnostics();
+		}
 	}
 
-	private onDidChangeDocument(e: TextDocumentChangeEvent): void {
-		let filepath: string = this.client.asAbsolutePath(e.document.uri);
+	private onDidChangeTextDocument(e: TextDocumentChangeEvent): void {
+		let filepath = this.client.normalizePath(e.document.uri);
 		if (!filepath) {
 			return;
 		}
-		let syncedBuffer = this.syncedBuffers[filepath];
+		let syncedBuffer = this.syncedBuffers.get(filepath);
 		if (!syncedBuffer) {
 			return;
 		}
@@ -163,24 +209,42 @@ export default class BufferSyncSupport {
 	}
 
 	public requestAllDiagnostics() {
-		Object.keys(this.syncedBuffers).forEach(filePath => this.pendingDiagnostics[filePath] = Date.now());
+		if (!this._validate) {
+			return;
+		}
+		for (const filePath of this.syncedBuffers.keys()) {
+			this.pendingDiagnostics.set(filePath, Date.now());
+		}
 		this.diagnosticDelayer.trigger(() => {
 			this.sendPendingDiagnostics();
-		});
+		}, 200);
 	}
 
 	public requestDiagnostic(file: string): void {
-		this.pendingDiagnostics[file] = Date.now();
+		if (!this._validate) {
+			return;
+		}
+
+		this.pendingDiagnostics.set(file, Date.now());
+		const buffer = this.syncedBuffers.get(file);
+		let delay = 300;
+		if (buffer) {
+			let lineCount = buffer.lineCount;
+			delay = Math.min(Math.max(Math.ceil(lineCount / 20), 300), 800);
+		}
 		this.diagnosticDelayer.trigger(() => {
 			this.sendPendingDiagnostics();
-		});
+		}, delay);
 	}
 
 	private sendPendingDiagnostics(): void {
-		let files = Object.keys(this.pendingDiagnostics).map((key) => {
+		if (!this._validate) {
+			return;
+		}
+		let files = Array.from(this.pendingDiagnostics.entries()).map(([key, value]) => {
 			return {
 				file: key,
-				time: this.pendingDiagnostics[key]
+				time: value
 			};
 		}).sort((a, b) => {
 			return a.time - b.time;
@@ -189,17 +253,74 @@ export default class BufferSyncSupport {
 		});
 
 		// Add all open TS buffers to the geterr request. They might be visible
-		Object.keys(this.syncedBuffers).forEach((file) => {
-			if (!this.pendingDiagnostics[file]) {
+		for (const file of this.syncedBuffers.keys()) {
+			if (!this.pendingDiagnostics.get(file)) {
 				files.push(file);
 			}
-		});
+		}
 
-		let args: Proto.GeterrRequestArgs = {
-			delay: 0,
-			files: files
-		};
-		this.client.execute('geterr', args, false);
-		this.pendingDiagnostics = Object.create(null);
+		if (files.length) {
+			const args: Proto.GeterrRequestArgs = {
+				delay: 0,
+				files: files
+			};
+			this.client.execute('geterr', args, false);
+		}
+		this.pendingDiagnostics.clear();
+	}
+
+	private checkTSCVersion() {
+		if (!this.checkGlobalTSCVersion) {
+			return;
+		}
+		this.checkGlobalTSCVersion = false;
+
+		interface MyMessageItem extends MessageItem {
+			id: number;
+		}
+
+		let tscVersion: string | undefined = undefined;
+		try {
+			let out = cp.execSync('tsc --version', { encoding: 'utf8' });
+			if (out) {
+				let matches = out.trim().match(/Version\s*(.*)$/);
+				if (matches && matches.length === 2) {
+					tscVersion = matches[1];
+				}
+			}
+		} catch (error) {
+		}
+		if (tscVersion && tscVersion !== this.client.apiVersion.versionString) {
+			window.showInformationMessage<MyMessageItem>(
+				localize('versionMismatch', 'Using TypeScript ({1}) for editor features. TypeScript ({0}) is installed globally on your machine. Errors in VS Code  may differ from TSC errors', tscVersion, this.client.apiVersion.versionString),
+				{
+					title: localize('moreInformation', 'More Information'),
+					id: 1
+				},
+				{
+					title: localize('doNotCheckAgain', 'Don\'t Check Again'),
+					id: 2
+				},
+				{
+					title: localize('close', 'Close'),
+					id: 3,
+					isCloseAffordance: true
+				}
+			).then((selected) => {
+				if (!selected || selected.id === 3) {
+					return;
+				}
+				switch (selected.id) {
+					case 1:
+						commands.executeCommand('vscode.open', Uri.parse('http://go.microsoft.com/fwlink/?LinkId=826239'));
+						break;
+					case 2:
+						const tsConfig = workspace.getConfiguration('typescript');
+						tsConfig.update(checkTscVersionSettingKey, false, true);
+						window.showInformationMessage(localize('updateTscCheck', 'Updated user setting \'typescript.check.tscVersion\' to false'));
+						break;
+				}
+			});
+		}
 	}
 }

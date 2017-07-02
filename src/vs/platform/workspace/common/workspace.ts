@@ -5,28 +5,44 @@
 'use strict';
 
 import URI from 'vs/base/common/uri';
-import {createDecorator, ServiceIdentifier} from 'vs/platform/instantiation/common/instantiation';
+import { createDecorator } from 'vs/platform/instantiation/common/instantiation';
+import * as paths from 'vs/base/common/paths';
+import { TrieMap } from 'vs/base/common/map';
+import { isLinux } from 'vs/base/common/platform';
+import Event from 'vs/base/common/event';
 
-export var IWorkspaceContextService = createDecorator<IWorkspaceContextService>('contextService');
+export const IWorkspaceContextService = createDecorator<IWorkspaceContextService>('contextService');
 
 export interface IWorkspaceContextService {
-	serviceId: ServiceIdentifier<any>;
+	_serviceBrand: any;
+
+	/**
+	 * Returns iff the application was opened with a workspace or not.
+	 */
+	hasWorkspace(): boolean;
 
 	/**
 	 * Provides access to the workspace object the platform is running with. This may be null if the workbench was opened
 	 * without workspace (empty);
 	 */
-	getWorkspace(): IWorkspace;
+	getWorkspace(): ILegacyWorkspace;
 
 	/**
-	 * Provides access to the configuration object the platform is running with.
+	 * Provides access to the workspace object the platform is running with. This may be null if the workbench was opened
+	 * without workspace (empty);
 	 */
-	getConfiguration(): IConfiguration;
+	getWorkspace2(): IWorkspace;
 
 	/**
-	 * Provides access to the options object the platform is running with.
+	 * An event which fires on workspace roots change.
 	 */
-	getOptions(): any;
+	onDidChangeWorkspaceRoots: Event<void>;
+
+	/**
+	 * Returns the root for the given resource from the workspace.
+	 * Can be null if there is no workspace or the resource is not inside the workspace.
+	 */
+	getRoot(resource: URI): URI;
 
 	/**
 	 * Returns iff the provided resource is inside the workspace or not.
@@ -38,7 +54,7 @@ export interface IWorkspaceContextService {
 	 * without leading or trailing slashes. Returns null if the file is not inside an opened
 	 * workspace.
 	 */
-	toWorkspaceRelativePath: (resource: URI) => string;
+	toWorkspaceRelativePath: (resource: URI, toOSPath?: boolean) => string;
 
 	/**
 	 * Given a workspace relative path, returns the resource with the absolute path.
@@ -46,102 +62,122 @@ export interface IWorkspaceContextService {
 	toResource: (workspaceRelativePath: string) => URI;
 }
 
-export interface IWorkspace {
+export interface ILegacyWorkspace {
 
 	/**
 	 * the full uri of the workspace. this is a file:// URL to the location
 	 * of the workspace on disk.
 	 */
 	resource: URI;
-
-	/**
-	 * the identifier that uniquely identifies this workspace among others.
-	 */
-	id: string;
-
-	/**
-	 * the name of the workspace
-	 */
-	name: string;
-
-	/**
-	 * the last modified date of the workspace if known
-	 */
-	mtime?: number;
-
-	/**
-	 * the unique identifier of the workspace. if the workspace is deleted and recreated
-	 * the identifier also changes. this makes the uid more unique compared to the id which
-	 * is just derived from the workspace name.
-	 */
-	uid?: number;
 }
 
-export interface IConfiguration {
+export interface IWorkspace {
 
 	/**
-	 * Additional worker services
+	 * the unique identifier of the workspace.
 	 */
-	additionalWorkerServices?: { serviceId: string; moduleName: string; ctorName: string; }[];
+	readonly id: string;
 
 	/**
-	 * Some environmental flags
+	 * the name of the workspace.
 	 */
-	env?: IEnvironment;
+	readonly name: string;
+
+	/**
+	 * Mutliple roots in this workspace. First entry is master and never changes.
+	 */
+	readonly roots: URI[];
 }
 
-export interface IEnvironment {
-	appName: string;
-	appRoot: string;
-	isBuilt: boolean;
-	execPath: string;
+export class LegacyWorkspace implements ILegacyWorkspace {
+	private _name: string;
 
-	version: string;
-	commitHash: string;
+	constructor(private _resource: URI, private _ctime?: number) {
+		this._name = paths.basename(this._resource.fsPath) || this._resource.fsPath;
+	}
 
-	updateFeedUrl: string;
-	updateChannel: string;
+	public get resource(): URI {
+		return this._resource;
+	}
 
-	extensionsGallery: {
-		serviceUrl: string;
-		itemUrl: string;
-	};
+	public get name(): string {
+		return this._name;
+	}
 
-	releaseNotesUrl: string;
-	productDownloadUrl: string;
+	public get ctime(): number {
+		return this._ctime;
+	}
 
-	welcomePage: string;
+	public toWorkspaceRelativePath(resource: URI, toOSPath?: boolean): string {
+		if (this.contains(resource)) {
+			return paths.normalize(paths.relative(this._resource.fsPath, resource.fsPath), toOSPath);
+		}
 
-	crashReporter: any;
+		return null;
+	}
 
-	appSettingsHome: string;
-	appSettingsPath: string;
-	appKeybindingsPath: string;
+	private contains(resource: URI): boolean {
+		if (resource) {
+			return paths.isEqualOrParent(resource.fsPath, this._resource.fsPath, !isLinux /* ignorecase */);
+		}
 
-	debugPluginHostPort: number;
-	debugBrkPluginHost: boolean;
+		return false;
+	}
 
-	logPluginHostCommunication: boolean;
-	verboseLogging: boolean;
-	enablePerformance: boolean;
+	public toResource(workspaceRelativePath: string, root?: URI): URI {
+		if (typeof workspaceRelativePath === 'string') {
+			return URI.file(paths.join(root ? root.fsPath : this._resource.fsPath, workspaceRelativePath));
+		}
 
-	userPluginsHome: string;
-	sharedIPCHandle: string;
-	pluginDevelopmentPath: string;
-	pluginTestsPath: string;
+		return null;
+	}
+}
 
-	recentPaths: string[];
+export class Workspace implements IWorkspace {
 
-	enableTelemetry: boolean;
+	private _rootsMap: TrieMap<URI> = new TrieMap<URI>(TrieMap.PathSplitter);
 
-	aiConfig: {
-		key: string;
-		asimovKey: string;
-	},
+	constructor(
+		public readonly id: string,
+		private _name: string,
+		private _roots: URI[]
+	) {
+		this.updateRootsMap();
+	}
 
-	sendASmile: {
-		submitUrl: string,
-		reportIssueUrl: string,
-		requestFeatureUrl: string
+	public get roots(): URI[] {
+		return this._roots;
+	}
+
+	public set roots(roots: URI[]) {
+		this._roots = roots;
+		this.updateRootsMap();
+	}
+
+	public get name(): string {
+		return this._name;
+	}
+
+	public set name(name: string) {
+		this._name = name;
+	}
+
+	public getRoot(resource: URI): URI {
+		if (!resource) {
+			return null;
+		}
+
+		return this._rootsMap.findSubstr(resource.fsPath);
+	}
+
+	private updateRootsMap(): void {
+		this._rootsMap = new TrieMap<URI>(TrieMap.PathSplitter);
+		for (const root of this.roots) {
+			this._rootsMap.insert(root.fsPath, root);
+		}
+	}
+
+	public toJSON(): IWorkspace {
+		return { id: this.id, roots: this.roots, name: this.name };
 	}
 }

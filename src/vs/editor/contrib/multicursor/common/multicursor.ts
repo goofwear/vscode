@@ -4,38 +4,138 @@
  *--------------------------------------------------------------------------------------------*/
 'use strict';
 
-import nls = require('vs/nls');
-import {CommonEditorRegistry, ContextKey, EditorActionDescriptor} from 'vs/editor/common/editorCommonExtensions';
-import {HandlerEditorAction} from 'vs/editor/common/editorAction';
-import EditorCommon = require('vs/editor/common/editorCommon');
-import {INullService} from 'vs/platform/instantiation/common/instantiation';
-import {KeyMod, KeyCode} from 'vs/base/common/keyCodes';
+import * as nls from 'vs/nls';
+import { KeyCode, KeyMod } from 'vs/base/common/keyCodes';
+import { ICommonCodeEditor } from 'vs/editor/common/editorCommon';
+import { EditorContextKeys } from 'vs/editor/common/editorContextKeys';
+import { editorAction, ServicesAccessor, EditorAction } from 'vs/editor/common/editorCommonExtensions';
+import { Selection } from 'vs/editor/common/core/selection';
+import { CursorChangeReason } from 'vs/editor/common/controller/cursorEvents';
+import { CursorMoveCommands } from 'vs/editor/common/controller/cursorMoveCommands';
+import { CursorState, RevealTarget } from 'vs/editor/common/controller/cursorCommon';
 
-class InsertCursorAbove extends HandlerEditorAction {
-	static ID = 'editor.action.insertCursorAbove';
+@editorAction
+export class InsertCursorAbove extends EditorAction {
+	constructor() {
+		super({
+			id: 'editor.action.insertCursorAbove',
+			label: nls.localize('mutlicursor.insertAbove', "Add Cursor Above"),
+			alias: 'Add Cursor Above',
+			precondition: null,
+			kbOpts: {
+				kbExpr: EditorContextKeys.textFocus,
+				primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.UpArrow,
+				linux: {
+					primary: KeyMod.Shift | KeyMod.Alt | KeyCode.UpArrow,
+					secondary: [KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.UpArrow]
+				}
+			}
+		});
+	}
 
-	constructor(descriptor:EditorCommon.IEditorActionDescriptorData, editor:EditorCommon.ICommonCodeEditor, @INullService ns) {
-		super(descriptor, editor, EditorCommon.Handler.AddCursorUp);
+	public run(accessor: ServicesAccessor, editor: ICommonCodeEditor, args: any): void {
+		const cursors = editor._getCursors();
+		const context = cursors.context;
+
+		if (context.config.readOnly) {
+			return;
+		}
+
+		context.model.pushStackElement();
+		cursors.setStates(
+			args.source,
+			CursorChangeReason.Explicit,
+			CursorState.ensureInEditableRange(
+				context,
+				CursorMoveCommands.addCursorUp(context, cursors.getAll())
+			)
+		);
+		cursors.reveal(true, RevealTarget.TopMost);
 	}
 }
 
-class InsertCursorBelow extends HandlerEditorAction {
-	static ID = 'editor.action.insertCursorBelow';
+@editorAction
+export class InsertCursorBelow extends EditorAction {
+	constructor() {
+		super({
+			id: 'editor.action.insertCursorBelow',
+			label: nls.localize('mutlicursor.insertBelow', "Add Cursor Below"),
+			alias: 'Add Cursor Below',
+			precondition: null,
+			kbOpts: {
+				kbExpr: EditorContextKeys.textFocus,
+				primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.DownArrow,
+				linux: {
+					primary: KeyMod.Shift | KeyMod.Alt | KeyCode.DownArrow,
+					secondary: [KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.DownArrow]
+				}
+			}
+		});
+	}
 
-	constructor(descriptor:EditorCommon.IEditorActionDescriptorData, editor:EditorCommon.ICommonCodeEditor, @INullService ns) {
-		super(descriptor, editor, EditorCommon.Handler.AddCursorDown);
+	public run(accessor: ServicesAccessor, editor: ICommonCodeEditor, args: any): void {
+		const cursors = editor._getCursors();
+		const context = cursors.context;
+
+		if (context.config.readOnly) {
+			return;
+		}
+
+		context.model.pushStackElement();
+		cursors.setStates(
+			args.source,
+			CursorChangeReason.Explicit,
+			CursorState.ensureInEditableRange(
+				context,
+				CursorMoveCommands.addCursorDown(context, cursors.getAll())
+			)
+		);
+		cursors.reveal(true, RevealTarget.BottomMost);
 	}
 }
 
+@editorAction
+class InsertCursorAtEndOfEachLineSelected extends EditorAction {
 
-// register actions
-CommonEditorRegistry.registerEditorAction(new EditorActionDescriptor(InsertCursorAbove, InsertCursorAbove.ID, nls.localize('mutlicursor.insertAbove', "Insert Cursor Above"), {
-	context: ContextKey.EditorTextFocus,
-	primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.UpArrow,
-	linux: { primary: KeyMod.CtrlCmd| KeyMod.WinCtrl | KeyCode.UpArrow }
-}));
-CommonEditorRegistry.registerEditorAction(new EditorActionDescriptor(InsertCursorBelow, InsertCursorBelow.ID, nls.localize('mutlicursor.insertBelow', "Insert Cursor Below"), {
-	context: ContextKey.EditorTextFocus,
-	primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.DownArrow,
-	linux: { primary: KeyMod.CtrlCmd| KeyMod.WinCtrl | KeyCode.DownArrow }
-}));
+	constructor() {
+		super({
+			id: 'editor.action.insertCursorAtEndOfEachLineSelected',
+			label: nls.localize('mutlicursor.insertAtEndOfEachLineSelected', "Add Cursors to Line Ends"),
+			alias: 'Add Cursors to Line Ends',
+			precondition: null,
+			kbOpts: {
+				kbExpr: EditorContextKeys.textFocus,
+				primary: KeyMod.Shift | KeyMod.Alt | KeyCode.KEY_I
+			}
+		});
+	}
+
+	private getCursorsForSelection(selection: Selection, editor: ICommonCodeEditor): Selection[] {
+		if (selection.isEmpty()) {
+			return [];
+		}
+
+		let model = editor.getModel();
+		let newSelections: Selection[] = [];
+		for (let i = selection.startLineNumber; i < selection.endLineNumber; i++) {
+			let currentLineMaxColumn = model.getLineMaxColumn(i);
+			newSelections.push(new Selection(i, currentLineMaxColumn, i, currentLineMaxColumn));
+		}
+		if (selection.endColumn > 1) {
+			newSelections.push(new Selection(selection.endLineNumber, selection.endColumn, selection.endLineNumber, selection.endColumn));
+		}
+
+		return newSelections;
+	}
+
+	public run(accessor: ServicesAccessor, editor: ICommonCodeEditor): void {
+		let selections = editor.getSelections();
+		let newSelections = selections
+			.map((selection) => this.getCursorsForSelection(selection, editor))
+			.reduce((prev, curr) => { return prev.concat(curr); });
+
+		if (newSelections.length > 0) {
+			editor.setSelections(newSelections);
+		}
+	}
+}

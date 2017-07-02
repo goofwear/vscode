@@ -4,35 +4,53 @@
  *--------------------------------------------------------------------------------------------*/
 'use strict';
 
-import {PPromise} from 'vs/base/common/winjs.base';
+import { PPromise, TPromise } from 'vs/base/common/winjs.base';
 import uri from 'vs/base/common/uri';
-import glob = require('vs/base/common/glob');
-import {IFilesConfiguration} from 'vs/platform/files/common/files';
-import {createDecorator, ServiceIdentifier} from 'vs/platform/instantiation/common/instantiation';
+import * as paths from 'vs/base/common/paths';
+import * as objects from 'vs/base/common/objects';
+import { IExpression } from 'vs/base/common/glob';
+import { IFilesConfiguration } from 'vs/platform/files/common/files';
+import { createDecorator } from 'vs/platform/instantiation/common/instantiation';
 
-export var ID = 'searchService';
+export const ID = 'searchService';
 
-export var ISearchService = createDecorator<ISearchService>(ID);
+export const ISearchService = createDecorator<ISearchService>(ID);
+
 /**
  * A service that enables to search for files or with in files.
  */
 export interface ISearchService {
-	serviceId: ServiceIdentifier<any>;
+	_serviceBrand: any;
 	search(query: ISearchQuery): PPromise<ISearchComplete, ISearchProgressItem>;
+	extendQuery(query: ISearchQuery): void;
+	clearCache(cacheKey: string): TPromise<void>;
+}
+
+export interface IFolderQueryOptions {
+	folder: uri;
+	excludePattern?: IExpression;
+	fileEncoding?: string;
 }
 
 export interface IQueryOptions {
-	rootResources?: uri[];
-	filePatterns?: IPatternInfo[];
-	excludePattern?: glob.IExpression;
-	includePattern?: glob.IExpression;
-	maxResults?: number;
+	extraFileResources?: uri[];
+	filePattern?: string;
+	excludePattern?: IExpression;
+	includePattern?: IExpression;
 	fileEncoding?: string;
+	maxResults?: number;
+	sortByScore?: boolean;
+	cacheKey?: string;
+	useRipgrep?: boolean;
+	disregardIgnoreFiles?: boolean;
+	disregardExcludeSettings?: boolean;
+	searchPaths?: string[];
 }
 
 export interface ISearchQuery extends IQueryOptions {
 	type: QueryType;
 	contentPattern?: IPatternInfo;
+	folderQueries?: IFolderQueryOptions[];
 }
 
 export enum QueryType {
@@ -44,6 +62,8 @@ export interface IPatternInfo {
 	pattern: string;
 	isRegExp?: boolean;
 	isWordMatch?: boolean;
+	wordSeparators?: string;
+	isMultiline?: boolean;
 	isCaseSensitive?: boolean;
 }
 
@@ -63,15 +83,46 @@ export interface IProgress {
 	worked?: number;
 }
 
-export interface ISearchProgressItem extends IFileMatch, IProgress {
+export interface ISearchLog {
+	message?: string;
+}
+
+export interface ISearchProgressItem extends IFileMatch, IProgress, ISearchLog {
 	// Marker interface to indicate the possible values for progress calls from the engine
 }
 
 export interface ISearchComplete {
 	limitHit?: boolean;
 	results: IFileMatch[];
+	stats: ISearchStats;
 }
 
+export interface ISearchStats {
+	fromCache: boolean;
+	resultCount: number;
+	unsortedResultTime?: number;
+	sortedResultTime?: number;
+}
+
+export interface ICachedSearchStats extends ISearchStats {
+	cacheLookupStartTime: number;
+	cacheFilterStartTime: number;
+	cacheLookupResultTime: number;
+	cacheEntryCount: number;
+	joined?: ISearchStats;
+}
+
+export interface IUncachedSearchStats extends ISearchStats {
+	traversal: string;
+	errors: string[];
+	fileWalkStartTime: number;
+	fileWalkResultTime: number;
+	directoriesWalked: number;
+	filesWalked: number;
+	cmdForkStartTime?: number;
+	cmdForkResultTime?: number;
+	cmdResultCount?: number;
+}
 
 
 // ---- very simple implementation of the search model --------------------
@@ -91,6 +142,52 @@ export class LineMatch implements ILineMatch {
 
 export interface ISearchConfiguration extends IFilesConfiguration {
 	search: {
-		exclude: glob.IExpression;
+		exclude: IExpression;
+		useRipgrep: boolean;
+		useIgnoreFilesByDefault: boolean;
 	};
+	editor: {
+		wordSeparators: string;
+	};
+}
+
+export function getExcludes(configuration: ISearchConfiguration): IExpression {
+	const fileExcludes = configuration && configuration.files && configuration.files.exclude;
+	const searchExcludes = configuration && configuration.search && configuration.search.exclude;
+
+	if (!fileExcludes && !searchExcludes) {
+		return null;
+	}
+
+	if (!fileExcludes || !searchExcludes) {
+		return fileExcludes || searchExcludes;
+	}
+
+	let allExcludes: IExpression = Object.create(null);
+	allExcludes = objects.mixin(allExcludes, fileExcludes);
+	allExcludes = objects.mixin(allExcludes, searchExcludes, true);
+
+	return allExcludes;
+}
+
+export function getMergedExcludes(query: ISearchQuery, absolutePaths?: boolean): IExpression {
+	const globalExcludePattern: IExpression = query.excludePattern || {};
+
+	return query.folderQueries
+		.map(folderQuery => {
+			const mergedFolderExclude = objects.assign({}, globalExcludePattern, folderQuery.excludePattern || {});
+			return absolutePaths ?
+				makeExcludesAbsolute(mergedFolderExclude, folderQuery.folder) :
+				mergedFolderExclude;
+		});
+}
+
+function makeExcludesAbsolute(excludePattern: IExpression, rootFolder: uri) {
+	return Object.keys(excludePattern)
+		.reduce((absolutePattern: IExpression, key: string) => {
+			const value = excludePattern[key];
+			key = paths.join(rootFolder.fsPath, key);
+			absolutePattern[key] = value;
+			return absolutePattern;
+		}, {});
 }

@@ -4,67 +4,67 @@
  *--------------------------------------------------------------------------------------------*/
 'use strict';
 
-import assert = require('vs/base/common/assert');
-import types = require('vs/base/common/types');
+import { IExpression } from 'vs/base/common/glob';
+import { mixin } from 'vs/base/common/objects';
 import uri from 'vs/base/common/uri';
-import glob = require('vs/base/common/glob');
-import strings = require('vs/base/common/strings');
-import objects = require('vs/base/common/objects');
-import {TPromise} from 'vs/base/common/winjs.base';
-import search = require('vs/platform/search/common/search');
-import {IConfigurationService, IConfigurationServiceEvent, ConfigurationServiceEventTypes} from 'vs/platform/configuration/common/configuration';
-
-export function getExcludes(configuration: search.ISearchConfiguration): glob.IExpression {
-	let fileExcludes = configuration && configuration.files && configuration.files.exclude;
-	let searchExcludes = configuration && configuration.search && configuration.search.exclude;
-
-	if (!fileExcludes && !searchExcludes) {
-		return null;
-	}
-
-	if (!fileExcludes || !searchExcludes) {
-		return fileExcludes || searchExcludes;
-	}
-
-	let allExcludes: glob.IExpression = Object.create(null);
-	allExcludes = objects.mixin(allExcludes, fileExcludes);
-	allExcludes = objects.mixin(allExcludes, searchExcludes, true);
-
-	return allExcludes;
-}
+import { IPatternInfo, IQueryOptions, IFolderQueryOptions, ISearchQuery, QueryType, ISearchConfiguration, getExcludes } from 'vs/platform/search/common/search';
+import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 
 export class QueryBuilder {
 
 	constructor( @IConfigurationService private configurationService: IConfigurationService) {
 	}
 
-	public text(contentPattern: search.IPatternInfo, options?: search.IQueryOptions): TPromise<search.ISearchQuery> {
-		return this.query(search.QueryType.Text, contentPattern, options);
+	public text(contentPattern: IPatternInfo, folderResources?: uri[], options?: IQueryOptions): ISearchQuery {
+		return this.query(QueryType.Text, contentPattern, folderResources, options);
 	}
 
-	public file(options?: search.IQueryOptions): TPromise<search.ISearchQuery> {
-		return this.query(search.QueryType.File, null, options);
+	public file(folderResources?: uri[], options?: IQueryOptions): ISearchQuery {
+		return this.query(QueryType.File, null, folderResources, options);
 	}
 
-	private query(type: search.QueryType, contentPattern: search.IPatternInfo, options: search.IQueryOptions = {}): TPromise<search.ISearchQuery> {
-		return this.configurationService.loadConfiguration().then((configuration: search.ISearchConfiguration) => {
-			let excludePattern = getExcludes(configuration);
-			if (!options.excludePattern) {
-				options.excludePattern = excludePattern;
-			} else {
-				objects.mixin(options.excludePattern, excludePattern, false /* no overwrite */);
-			}
-
-			return {
-				type: type,
-				rootResources: options.rootResources,
-				filePatterns: options.filePatterns || [],
-				excludePattern: options.excludePattern,
-				includePattern: options.includePattern,
-				maxResults: options.maxResults,
-				fileEncoding: options.fileEncoding,
-				contentPattern: contentPattern
+	private query(type: QueryType, contentPattern: IPatternInfo, folderResources?: uri[], options: IQueryOptions = {}): ISearchQuery {
+		const folderQueries = folderResources && folderResources.map(folder => {
+			const folderConfig = this.configurationService.getConfiguration<ISearchConfiguration>(undefined, { resource: folder });
+			return <IFolderQueryOptions>{
+				folder,
+				excludePattern: this.getExcludesForFolder(folderConfig, options),
+				fileEncoding: folderConfig.files.encoding
 			};
 		});
+
+		const useRipgrep = !folderResources || folderResources.every(folder => {
+			const folderConfig = this.configurationService.getConfiguration<ISearchConfiguration>(undefined, { resource: folder });
+			return folderConfig.search.useRipgrep;
+		});
+
+		return {
+			type,
+			folderQueries,
+			extraFileResources: options.extraFileResources,
+			filePattern: options.filePattern,
+			excludePattern: options.excludePattern,
+			includePattern: options.includePattern,
+			maxResults: options.maxResults,
+			sortByScore: options.sortByScore,
+			cacheKey: options.cacheKey,
+			contentPattern: contentPattern,
+			useRipgrep,
+			disregardIgnoreFiles: options.disregardIgnoreFiles,
+			disregardExcludeSettings: options.disregardExcludeSettings,
+			searchPaths: options.searchPaths
+		};
+	}
+
+	private getExcludesForFolder(folderConfig: ISearchConfiguration, options: IQueryOptions): IExpression | null {
+		const settingsExcludePattern = getExcludes(folderConfig);
+
+		if (options.disregardExcludeSettings) {
+			return null;
+		} else if (options.excludePattern) {
+			return mixin(options.excludePattern, settingsExcludePattern, false /* no overwrite */);
+		} else {
+			return settingsExcludePattern;
+		}
 	}
 }

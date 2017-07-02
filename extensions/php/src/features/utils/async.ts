@@ -103,7 +103,7 @@ export class Throttler<T> {
 export class Delayer<T> {
 
 	public defaultDelay: number;
-	private timeout: number;
+	private timeout: NodeJS.Timer;
 	private completionPromise: Promise<T>;
 	private onResolve: (value: T | Thenable<T>) => void;
 	private task: ITask<T>;
@@ -176,7 +176,7 @@ export class ThrottledDelayer<T> extends Delayer<Promise<T>> {
 	constructor(defaultDelay: number) {
 		super(defaultDelay);
 
-		this.throttler = new Throttler();
+		this.throttler = new Throttler<T>();
 	}
 
 	public trigger(promiseFactory: ITask<Promise<T>>, delay?: number): Promise<Promise<T>> {

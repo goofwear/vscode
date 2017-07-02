@@ -6,23 +6,13 @@
 
 import * as Types from 'vs/base/common/types';
 
-/**
- * Equalable objects can compute a
- * hash-code and can also tell if they
- * are equal to other objects
- */
-export interface IEqualable {
-	hashCode(): number;
-	equals(other: any): boolean;
-}
-
-
 export function clone<T>(obj: T): T {
 	if (!obj || typeof obj !== 'object') {
 		return obj;
 	}
 	if (obj instanceof RegExp) {
-		return obj;
+		// See https://github.com/Microsoft/TypeScript/issues/10990
+		return obj as any;
 	}
 	var result = (Array.isArray(obj)) ? <any>[] : <any>{};
 	Object.keys(obj).forEach((key) => {
@@ -92,40 +82,6 @@ function _cloneAndChange(obj: any, changer: (orig: any) => any, encounteredObjec
 	return obj;
 }
 
-// DON'T USE THESE FUNCTION UNLESS YOU KNOW HOW CHROME
-// WORKS... WE HAVE SEEN VERY WEIRD BEHAVIOUR WITH CHROME >= 37
-
-///**
-// * Recursively call Object.freeze on object and any properties that are objects.
-// */
-//export function deepFreeze(obj:any):void {
-//	Object.freeze(obj);
-//	Object.keys(obj).forEach((key) => {
-//		if(!(typeof obj[key] === 'object') || Object.isFrozen(obj[key])) {
-//			return;
-//		}
-//
-//		deepFreeze(obj[key]);
-//	});
-//	if(!Object.isFrozen(obj)) {
-//		console.log('too warm');
-//	}
-//}
-//
-//export function deepSeal(obj:any):void {
-//	Object.seal(obj);
-//	Object.keys(obj).forEach((key) => {
-//		if(!(typeof obj[key] === 'object') || Object.isSealed(obj[key])) {
-//			return;
-//		}
-//
-//		deepSeal(obj[key]);
-//	});
-//	if(!Object.isSealed(obj)) {
-//		console.log('NOT sealed');
-//	}
-//}
-
 /**
  * Copies all properties of source into destination. The optional parameter "overwrite" allows to control
  * if existing properties on the destination should be overwritten or not. Defaults to true (overwrite).
@@ -158,12 +114,8 @@ export function assign(destination: any, ...sources: any[]): any {
 	return destination;
 }
 
-/**
- * Returns a new object that has all values of {{obj}}
- * plus those from {{defaults}}.
- */
-export function withDefaults<T>(obj: T, defaults: T): T {
-	return mixin(clone(defaults), obj || {});
+export function toObject<T>(arr: T[], keyMap: (t: T) => string): { [key: string]: T } {
+	return arr.reduce((o, d) => assign(o, { [keyMap(d)]: d }), Object.create(null));
 }
 
 export function equals(one: any, other: any): boolean {
@@ -196,13 +148,13 @@ export function equals(one: any, other: any): boolean {
 			}
 		}
 	} else {
-		var oneKeys:string[] = [];
+		var oneKeys: string[] = [];
 
 		for (key in one) {
 			oneKeys.push(key);
 		}
 		oneKeys.sort();
-		var otherKeys:string[] = [];
+		var otherKeys: string[] = [];
 		for (key in other) {
 			otherKeys.push(key);
 		}
@@ -300,4 +252,40 @@ export function safeStringify(obj: any): string {
 		}
 		return value;
 	});
+}
+
+export function getOrDefault<T, R>(obj: T, fn: (obj: T) => R, defaultValue: R = null): R {
+	const result = fn(obj);
+	return typeof result === 'undefined' ? defaultValue : result;
+}
+
+/**
+ * Returns an object that has keys for each value that is different in the base object. Keys
+ * that do not exist in the target but in the base object are not considered.
+ *
+ * Note: This is not a deep-diffing method, so the values are strictly taken into the resulting
+ * object if they differ.
+ *
+ * @param base the object to diff against
+ * @param obj the object to use for diffing
+ */
+export type obj = { [key: string]: any; };
+export function distinct(base: obj, target: obj): obj {
+	const result = Object.create(null);
+
+	if (!base || !target) {
+		return result;
+	}
+
+	const targetKeys = Object.keys(target);
+	targetKeys.forEach(k => {
+		const baseValue = base[k];
+		const targetValue = target[k];
+
+		if (!equals(baseValue, targetValue)) {
+			result[k] = targetValue;
+		}
+	});
+
+	return result;
 }

@@ -1,11 +1,8 @@
 @echo off
 setlocal
-
-set npm_config_disturl="https://atom.io/download/atom-shell"
-for /f "delims=" %%A in ('powershell -Command "(Get-Content -Raw %~dp0..\package.json | ConvertFrom-Json).electronVersion"') do set "npm_config_target=%%A"
-set npm_config_arch="ia32"
-set HOME=~\.electron-gyp
-
+set npm_config_disturl="https://atom.io/download/electron"
+for /f "tokens=2 delims=:, " %%a in ('findstr /R /C:"\"electronVersion\":.*" "%~dp0..\package.json"') do set npm_config_target=%%~a
+set npm_config_runtime="electron"
+set npm_config_cache=~\.npm-electron
 npm %*
-
 endlocal
